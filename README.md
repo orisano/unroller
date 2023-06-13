@@ -76,7 +76,7 @@ func fooUnrolled() {
 
 You can then use the generated unrolled file in your codebase.
 
-It's important to note that the // UNROLL comment should be placed immediately before the for loop that you want to unroll. Also, remember to include the //go:generate unroller comment at the top of the file to ensure that the unrolling process is triggered when running go generate.
+It's important to note that the `// UNROLL` comment should be placed immediately before the for loop that you want to unroll. Also, remember to include the //go:generate unroller comment at the top of the file to ensure that the unrolling process is triggered when running go generate.
 
 ## Limitations
 
