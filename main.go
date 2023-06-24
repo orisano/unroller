@@ -61,80 +61,112 @@ func run() error {
 		if !ok {
 			continue
 		}
-		var unrolled ast.BlockStmt
-		for i, stmt := range funcDecl.Body.List {
-			forStmt, ok := stmt.(*ast.ForStmt)
-			if !ok {
+		funcDecl.Doc = nil
+		sps, err := specializedParams(commentMap[funcDecl])
+		if err != nil {
+			return fmt.Errorf("parse specialized param: %w", err)
+		}
+		for _, sp := range sps {
+			var unrolled ast.BlockStmt
+			originalFunc := struct {
+				Name string
+				Body *ast.BlockStmt
+				Type ast.FuncType
+			}{
+				Name: funcDecl.Name.Name,
+				Body: funcDecl.Body,
+				Type: *funcDecl.Type,
+			}
+			var rewrote bool
+			for i, stmt := range funcDecl.Body.List {
 				if len(unrolled.List) > 0 {
 					unrolled.List = append(unrolled.List, stmt)
 				}
-				continue
-			}
-			commentGroups, ok := commentMap[forStmt]
-			if !ok {
-				continue
-			}
-			if isUnrollTarget(commentGroups) {
-				cr, err := toConstantRange(forStmt)
+				forStmt, ok := stmt.(*ast.ForStmt)
+				if !ok {
+					continue
+				}
+				commentGroups, ok := commentMap[forStmt]
+				if !ok {
+					continue
+				}
+				u, err := parseUnroll(commentGroups)
 				if err != nil {
-					return err
+					return fmt.Errorf("parse unroll: %w", err)
+				}
+				if u == nil {
+					continue
+				}
+				r, err := toRange(forStmt)
+				if err != nil {
+					return fmt.Errorf("to range: %w", err)
 				}
 				if len(unrolled.List) == 0 {
 					unrolled.List = append(unrolled.List, funcDecl.Body.List[:i]...)
+				} else {
+					unrolled.List = unrolled.List[:len(unrolled.List)-1]
 				}
-				for x := cr.Init(); !cr.End(x); x = cr.Next(x) {
-					unrolled.List = append(unrolled.List, &ast.BlockStmt{
-						List: append([]ast.Stmt{
-							&ast.DeclStmt{
-								Decl: &ast.GenDecl{Tok: token.CONST, Specs: []ast.Spec{
-									&ast.ValueSpec{
-										Names:  []*ast.Ident{ast.NewIdent(cr.name)},
-										Values: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: strconv.Itoa(x)}},
-									},
-								}},
-							},
-						}, forStmt.Body.List...),
-					})
+				if r.IsDynamic() {
+					if sp == 0 {
+						var casesBlock ast.BlockStmt
+						m := r.DynamicMax(u.max)
+						for i := r.init; i < m; i++ {
+							casesBlock.List = append(casesBlock.List, &ast.CaseClause{
+								List: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: strconv.Itoa(m - i)}},
+								Body: []ast.Stmt{
+									forStmt.Body,
+									forStmt.Post,
+									&ast.BranchStmt{Tok: token.FALLTHROUGH},
+								},
+							})
+						}
+						casesBlock.List = append(casesBlock.List, &ast.CaseClause{
+							List: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: "0"}},
+						})
+						unrolled.List = append(unrolled.List, &ast.SwitchStmt{
+							Init: forStmt.Init,
+							Tag:  forStmt.Cond.(*ast.BinaryExpr).Y,
+							Body: &casesBlock,
+						})
+					} else {
+						if !rewrote {
+							funcDecl.Type.Params = rewriteConstantParam(r.DynamicVar(), funcDecl.Type.Params)
+							unrolled.List = append(append([]ast.Stmt{}, defConst(r.DynamicVar(), sp)), unrolled.List...)
+							rewrote = true
+						}
+						m := r.DynamicMax(sp)
+						for x := r.init; x < m; x++ {
+							unrolled.List = append(unrolled.List, &ast.BlockStmt{
+								List: append([]ast.Stmt{defConst(r.name, x)}, forStmt.Body.List...),
+							})
+						}
+					}
+				} else {
+					m := r.Max()
+					for x := r.init; x < m; x++ {
+						unrolled.List = append(unrolled.List, &ast.BlockStmt{
+							List: append([]ast.Stmt{defConst(r.name, x)}, forStmt.Body.List...),
+						})
+					}
 				}
-			} else if max, ok := isFallthroughTarget(commentGroups); ok {
-				dr, err := toDynamicRange(forStmt, max)
-				if err != nil {
-					return err
-				}
-				if len(unrolled.List) == 0 {
-					unrolled.List = append(unrolled.List, funcDecl.Body.List[:i]...)
-				}
-				var casesBlock ast.BlockStmt
-				for i := 0; i < dr.max; i++ {
-					casesBlock.List = append(casesBlock.List, &ast.CaseClause{
-						List: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: strconv.Itoa(dr.max - i)}},
-						Body: []ast.Stmt{
-							forStmt.Body,
-							forStmt.Post,
-							&ast.BranchStmt{Tok: token.FALLTHROUGH},
-						},
-					})
-				}
-				casesBlock.List = append(casesBlock.List, &ast.CaseClause{
-					List: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: "0"}},
-				})
-				unrolled.List = append(unrolled.List, &ast.SwitchStmt{
-					Init: forStmt.Init,
-					Tag:  forStmt.Cond.(*ast.BinaryExpr).Y,
-					Body: &casesBlock,
-				})
 			}
-		}
-		if len(unrolled.List) > 0 {
-			original := funcDecl.Name.Name
-			funcDecl.Name.Name += "Unrolled"
-			funcDecl.Body = &unrolled
+			if len(unrolled.List) > 0 {
+				funcDecl.Name.Name += "Unrolled"
+				if sp > 0 {
+					funcDecl.Name.Name += strconv.Itoa(sp)
+				}
+				funcDecl.Body = &unrolled
 
-			fmt.Fprintf(&buf, "// %s is the unrolled version of %s\n", funcDecl.Name.Name, original)
-			if err := printer.Fprint(&buf, token.NewFileSet(), funcDecl); err != nil {
-				return fmt.Errorf("write generated file: %w", err)
+				fmt.Fprintf(&buf, "// %s is the unrolled version of %s\n", funcDecl.Name.Name, originalFunc.Name)
+				if err := printer.Fprint(&buf, token.NewFileSet(), funcDecl); err != nil {
+					return fmt.Errorf("write generated file: %w", err)
+				}
+				buf.WriteString("\n\n")
+
+				funcDecl.Name.Name = originalFunc.Name
+				funcDecl.Body = originalFunc.Body
+				funcDecl.Type.Params = originalFunc.Type.Params
 			}
-			buf.WriteString("\n\n")
 		}
 	}
 
@@ -147,7 +179,7 @@ func run() error {
 		return err
 	}
 	defer f.Close()
-	fmt.Fprintln(f, "// Code generated by unroller. DO NOT EDIT.")
+	fmt.Fprintln(f, "// Code generated by github.com/orisano/unroller. DO NOT EDIT.")
 	if _, err := f.Write(b); err != nil {
 		return fmt.Errorf("write generated file: %w", err)
 	}
@@ -166,28 +198,50 @@ func getEnv(key string, defaultValue string) string {
 	}
 }
 
-func isUnrollTarget(cgs []*ast.CommentGroup) bool {
+func specializedParams(cgs []*ast.CommentGroup) ([]int, error) {
 	for _, cg := range cgs {
 		for _, c := range cg.List {
-			if c.Text == "// UNROLL" {
-				return true
+			if after, found := strings.CutPrefix(c.Text, "// SPECIALIZED:"); found {
+				return parseNumbers(after)
 			}
 		}
 	}
-	return false
+	return []int{0}, nil
 }
 
-func isFallthroughTarget(cgs []*ast.CommentGroup) (int, bool) {
+type Unroll struct {
+	bunchSize int
+	max       int
+}
+
+func parseUnroll(cgs []*ast.CommentGroup) (*Unroll, error) {
 	for _, cg := range cgs {
 		for _, c := range cg.List {
-			if after, found := strings.CutPrefix(c.Text, "// FALLTHROUGH "); found {
-				if max, err := strconv.Atoi(strings.TrimSpace(after)); err == nil {
-					return max, true
+			if after, found := strings.CutPrefix(c.Text, "// UNROLL"); found {
+				params, err := parseParams(after)
+				if err != nil {
+					return nil, fmt.Errorf("parse params: %w", err)
 				}
+				var u Unroll
+				if s, ok := params["bunchSize"]; ok {
+					x, err := strconv.Atoi(s)
+					if err != nil {
+						return nil, fmt.Errorf("parse bunchSize: %w", err)
+					}
+					u.bunchSize = x
+				}
+				if s, ok := params["max"]; ok {
+					x, err := strconv.Atoi(s)
+					if err != nil {
+						return nil, fmt.Errorf("parse max: %w", err)
+					}
+					u.max = x
+				}
+				return &u, nil
 			}
 		}
 	}
-	return 0, false
+	return nil, nil
 }
 
 func isInt(e ast.Expr) bool {
@@ -210,7 +264,7 @@ func unwrapCast(e ast.Expr) ast.Expr {
 	return e
 }
 
-func litInt(e ast.Expr) (int64, bool) {
+func litInt(e ast.Expr) (int, bool) {
 	lit, ok := unwrapCast(e).(*ast.BasicLit)
 	if !ok {
 		return 0, false
@@ -222,47 +276,102 @@ func litInt(e ast.Expr) (int64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	return x, true
+	return int(x), true
 }
 
-type constantRange struct {
-	name string
-	init int
-	end  int
-	step int
-	op   token.Token
+func parseParams(s string) (map[string]string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	p := map[string]string{}
+	for _, t := range strings.Split(s, ",") {
+		t = strings.TrimSpace(t)
+		sep := strings.IndexByte(t, '=')
+		if sep < 0 {
+			return nil, fmt.Errorf("parameter seperator not found")
+		}
+		p[t[:sep]] = t[sep+1:]
+	}
+	return p, nil
 }
 
-func (cr *constantRange) Init() int {
-	return cr.init
+func parseNumbers(s string) ([]int, error) {
+	var ns []int
+	for _, t := range strings.Split(s, ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(t))
+		if err != nil {
+			return nil, err
+		}
+		ns = append(ns, n)
+	}
+	return ns, nil
 }
 
-func (cr *constantRange) End(x int) bool {
-	switch cr.op {
-	case token.LEQ:
-		return !(x <= cr.end)
-	case token.LSS:
-		return !(x < cr.end)
-	case token.GTR:
-		return !(x > cr.end)
-	case token.GEQ:
-		return !(x >= cr.end)
-	case token.EQL:
-		return !(x == cr.end)
-	case token.NEQ:
-		return !(x != cr.end)
-	default:
-		panic("unreachable")
+func rewriteConstantParam(cParam string, params *ast.FieldList) *ast.FieldList {
+	var fl ast.FieldList
+	for _, p := range params.List {
+		f := &ast.Field{
+			Type: p.Type,
+		}
+		for _, name := range p.Names {
+			if name.Name != cParam {
+				f.Names = append(f.Names, name)
+			}
+		}
+		if len(f.Names) > 0 {
+			fl.List = append(fl.List, f)
+		}
+	}
+	return &fl
+}
+
+func defConst(name string, x int) *ast.DeclStmt {
+	return &ast.DeclStmt{
+		Decl: &ast.GenDecl{Tok: token.CONST, Specs: []ast.Spec{
+			&ast.ValueSpec{
+				Names:  []*ast.Ident{ast.NewIdent(name)},
+				Values: []ast.Expr{&ast.BasicLit{Kind: token.INT, Value: strconv.Itoa(x)}},
+			},
+		}},
 	}
 }
 
-func (cr *constantRange) Next(x int) int {
-	return x + cr.step
+type Range struct {
+	name string
+	init int
+	op   token.Token
+	cast string
+	max  ast.Expr
+}
+
+func (r *Range) IsDynamic() bool {
+	_, ok := r.max.(*ast.Ident)
+	return ok
+}
+
+func (r *Range) Max() int {
+	x, _ := strconv.ParseInt(r.max.(*ast.BasicLit).Value, 0, 64)
+	if r.op == token.LEQ {
+		x++
+	}
+	return int(x)
+}
+
+func (r *Range) DynamicVar() string {
+	return r.max.(*ast.Ident).Name
+}
+
+func (r *Range) DynamicMax(x int) int {
+	if r.op == token.LEQ {
+		x++
+	}
+	return x
 }
 
 var errUnsupportedStyleForStmt = errors.New("unsupported style for-stmt")
 
-func toConstantRange(s *ast.ForStmt) (*constantRange, error) {
+func toRange(s *ast.ForStmt) (*Range, error) {
 	assignStmt, ok := s.Init.(*ast.AssignStmt)
 	if !ok {
 		return nil, errUnsupportedStyleForStmt
@@ -273,107 +382,43 @@ func toConstantRange(s *ast.ForStmt) (*constantRange, error) {
 	name := assignStmt.Lhs[0].(*ast.Ident).Name
 	init, ok := litInt(assignStmt.Rhs[0])
 	if !ok {
-		return nil, errUnsupportedStyleForStmt
-	}
-	condExpr, ok := s.Cond.(*ast.BinaryExpr)
-	if !ok {
-		return nil, errUnsupportedStyleForStmt
-	}
-	if x, ok := condExpr.X.(*ast.Ident); !ok || x.Name != name {
-		return nil, errUnsupportedStyleForStmt
-	}
-	end, ok := litInt(condExpr.Y)
-	if !ok {
-		return nil, errUnsupportedStyleForStmt
-	}
-	switch condExpr.Op {
-	case token.LSS:
-	case token.LEQ:
-	case token.GTR:
-	case token.GEQ:
-	case token.EQL:
-	case token.NEQ:
-	default:
-		return nil, errUnsupportedStyleForStmt
-	}
-	var step int
-	switch stmt := s.Post.(type) {
-	case *ast.IncDecStmt:
-		if stmt.X.(*ast.Ident).Name != name {
-			return nil, errUnsupportedStyleForStmt
-		}
-		if stmt.Tok == token.INC {
-			step = 1
-		} else {
-			step = -1
-		}
-	case *ast.AssignStmt:
-		if len(stmt.Lhs) != 1 || len(stmt.Rhs) != 1 {
-			return nil, errUnsupportedStyleForStmt
-		}
-		if x, ok := stmt.Lhs[0].(*ast.Ident); !ok || x.Name != name {
-			return nil, errUnsupportedStyleForStmt
-		}
-		lit, ok := stmt.Rhs[0].(*ast.BasicLit)
-		if !ok || lit.Kind != token.INT {
-			return nil, errUnsupportedStyleForStmt
-		}
-		v, err := strconv.ParseInt(lit.Value, 0, 8)
-		if err != nil {
-			return nil, err
-		}
-		switch stmt.Tok {
-		case token.ADD_ASSIGN:
-			step = int(v)
-		case token.SUB_ASSIGN:
-			step = int(-v)
-		default:
-			return nil, errUnsupportedStyleForStmt
-		}
-	}
-	return &constantRange{name: name, init: int(init), op: condExpr.Op, end: int(end), step: step}, nil
-}
-
-type dynamicRange struct {
-	name    string
-	maxName string
-	max     int
-}
-
-func toDynamicRange(s *ast.ForStmt, max int) (*dynamicRange, error) {
-	assignStmt, ok := s.Init.(*ast.AssignStmt)
-	if !ok {
-		return nil, errUnsupportedStyleForStmt
-	}
-	if len(assignStmt.Lhs) != 1 || len(assignStmt.Rhs) != 1 {
-		return nil, errUnsupportedStyleForStmt
-	}
-	name := assignStmt.Lhs[0].(*ast.Ident).Name
-	init, ok := litInt(assignStmt.Rhs[0])
-	if !ok {
-		return nil, errUnsupportedStyleForStmt
-	}
-	if init != 0 {
-		return nil, errUnsupportedStyleForStmt
-	}
-	condExpr, ok := s.Cond.(*ast.BinaryExpr)
-	if !ok {
-		return nil, errUnsupportedStyleForStmt
-	}
-	if x, ok := condExpr.X.(*ast.Ident); !ok || x.Name != name {
-		return nil, errUnsupportedStyleForStmt
-	}
-	maxIdent, ok := unwrapCast(condExpr.Y).(*ast.Ident)
-	if !ok {
-		return nil, errUnsupportedStyleForStmt
-	}
-	switch condExpr.Op {
-	case token.LSS:
-	default:
 		return nil, errUnsupportedStyleForStmt
 	}
 	if stmt, ok := s.Post.(*ast.IncDecStmt); !ok || stmt.X.(*ast.Ident).Name != name || stmt.Tok != token.INC {
 		return nil, errUnsupportedStyleForStmt
 	}
-	return &dynamicRange{name: name, maxName: maxIdent.Name, max: max}, nil
+	condExpr, ok := s.Cond.(*ast.BinaryExpr)
+	if !ok {
+		return nil, errUnsupportedStyleForStmt
+	}
+	if ident, ok := condExpr.X.(*ast.Ident); !ok || ident.Name != name {
+		return nil, errUnsupportedStyleForStmt
+	}
+	switch condExpr.Op {
+	case token.LSS, token.LEQ:
+	default:
+		return nil, errUnsupportedStyleForStmt
+	}
+	cast := ""
+	y := condExpr.Y
+	if ce, ok := y.(*ast.CallExpr); ok && len(ce.Args) == 1 && isInt(ce.Fun) {
+		cast = ce.Fun.(*ast.Ident).Name
+		y = ce.Args[0]
+	}
+	switch e := y.(type) {
+	case *ast.BasicLit:
+		if e.Kind != token.INT {
+			return nil, errUnsupportedStyleForStmt
+		}
+	case *ast.Ident:
+	default:
+		return nil, errUnsupportedStyleForStmt
+	}
+	return &Range{
+		name: name,
+		init: init,
+		op:   condExpr.Op,
+		cast: cast,
+		max:  y,
+	}, nil
 }
